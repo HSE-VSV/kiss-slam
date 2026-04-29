@@ -21,6 +21,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 import os
+from collections import defaultdict
+from typing import Optional
 
 import numpy as np
 import open3d as o3d
@@ -39,12 +41,42 @@ class OccupancyGridMapper:
     ):
         self.config = config
         self.occupancy_mapping_pipeline = kiss_slam_pybind._OccupancyMapper(self.config.resolution)
+        self.has_intensity = False
+        self._intensity_sum_by_voxel = defaultdict(float)
+        self._intensity_count_by_voxel = defaultdict(int)
 
-    def integrate_frame(self, frame: np.ndarray, pose: np.ndarray):
+    def integrate_frame(
+        self, frame: np.ndarray, pose: np.ndarray, intensities: Optional[np.ndarray] = None
+    ):
         frame_downsampled = voxel_down_sample(frame, self.config.resolution).astype(np.float32)
         self.occupancy_mapping_pipeline._integrate_frame(
             kiss_slam_pybind._Vector3fVector(frame_downsampled), pose
         )
+        if intensities is not None:
+            self._integrate_intensities(frame, pose, intensities)
+
+    def _integrate_intensities(
+        self, frame: np.ndarray, pose: np.ndarray, intensities: np.ndarray
+    ):
+        if len(frame) != len(intensities):
+            raise ValueError(
+                f"Intensity length mismatch: got {len(intensities)} intensities "
+                f"for {len(frame)} points"
+            )
+
+        self.has_intensity = True
+        intensities = np.asarray(intensities)
+        rotation = pose[:3, :3]
+        translation = pose[:3, 3]
+        world_points = frame @ rotation.T + translation
+        valid = np.isfinite(world_points).all(axis=1) & np.isfinite(intensities)
+        voxel_indices = np.floor(world_points[valid] / self.config.resolution).astype(np.int32)
+        valid_intensities = intensities[valid].astype(np.float64)
+
+        for voxel, intensity in zip(voxel_indices, valid_intensities):
+            key = tuple(int(index) for index in voxel)
+            self._intensity_sum_by_voxel[key] += float(intensity)
+            self._intensity_count_by_voxel[key] += 1
 
     def compute_3d_occupancy_information(self):
         active_voxels, occupancies = self.occupancy_mapping_pipeline._get_active_voxels()
@@ -85,8 +117,55 @@ class OccupancyGridMapper:
         map_points = (0.5 + self.occupied_voxels) * self.config.resolution
         o3d_pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(map_points))
         o3d_pcd.estimate_normals()
-        o3d.io.write_point_cloud(os.path.join(output_dir, "occupancy_pcd.ply"), o3d_pcd)
-    
+        output_path = os.path.join(output_dir, "occupancy_pcd.ply")
+        if not self.has_intensity:
+            o3d.io.write_point_cloud(output_path, o3d_pcd)
+            return
+        self._write_occupancy_ply_with_intensity(
+            output_path, map_points, np.asarray(o3d_pcd.normals)
+        )
+
+    def _occupied_voxel_intensities(self):
+        values = np.zeros(len(self.occupied_voxels), dtype=np.float32)
+        missing = 0
+        for idx, voxel in enumerate(self.occupied_voxels):
+            key = tuple(int(index) for index in voxel)
+            count = self._intensity_count_by_voxel.get(key, 0)
+            if count > 0:
+                values[idx] = self._intensity_sum_by_voxel[key] / count
+            else:
+                missing += 1
+
+        if missing:
+            print(
+                f"KissSLAM| Warning: {missing} occupied voxels had no intensity observations; "
+                "wrote intensity=0.0"
+            )
+        return values
+
+    def _write_occupancy_ply_with_intensity(
+        self, output_path: str, map_points: np.ndarray, normals: np.ndarray
+    ):
+        intensities = self._occupied_voxel_intensities()
+        with open(output_path, "w") as ply_file:
+            ply_file.write("ply\n")
+            ply_file.write("format ascii 1.0\n")
+            ply_file.write(f"element vertex {len(map_points)}\n")
+            ply_file.write("property float x\n")
+            ply_file.write("property float y\n")
+            ply_file.write("property float z\n")
+            ply_file.write("property float nx\n")
+            ply_file.write("property float ny\n")
+            ply_file.write("property float nz\n")
+            ply_file.write("property float intensity\n")
+            ply_file.write("end_header\n")
+            for point, normal, intensity in zip(map_points, normals, intensities):
+                ply_file.write(
+                    f"{point[0]:.9g} {point[1]:.9g} {point[2]:.9g} "
+                    f"{normal[0]:.9g} {normal[1]:.9g} {normal[2]:.9g} "
+                    f"{float(intensity):.9g}\n"
+                )
+
     def write_3d_occupancy_boxai_volume(self, output_dir):
         self.occupancy_mapping_pipeline._save_occupancy_volume(
             os.path.join(output_dir, "occupancy_grid_bonxai.bin")

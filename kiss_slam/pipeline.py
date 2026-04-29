@@ -70,7 +70,7 @@ class SlamPipeline(OdometryPipeline):
 
     def _run_pipeline(self):
         for idx in trange(self._first, self._last, unit=" frames", dynamic_ncols=True):
-            scan, timestamps = self._next(idx)
+            scan, timestamps, _ = self._next(idx)
             start_time = time.perf_counter_ns()
             self.kiss_slam.process_scan(scan, timestamps)
             self.times[idx - self._first] = time.perf_counter_ns() - start_time
@@ -98,10 +98,19 @@ class SlamPipeline(OdometryPipeline):
             occupancy_grid_mapper = OccupancyGridMapper(self.slam_config.occupancy_mapper)
             print("KissSLAM| Computing Occupancy Grid")
             for idx in trange(self._first, self._last, unit=" frames", dynamic_ncols=True):
-                scan, timestamps = self._next(idx)
-                deskewed_scan = preprocessor.preprocess(scan, timestamps, deskewing_deltas[idx])
+                scan, timestamps, intensities = self._next(idx)
+                if intensities is None:
+                    deskewed_scan = preprocessor.preprocess(scan, timestamps, deskewing_deltas[idx])
+                    deskewed_intensities = None
+                else:
+                    deskewed_scan, kept_indices = preprocessor.preprocess_with_indices(
+                        scan, timestamps, deskewing_deltas[idx]
+                    )
+                    deskewed_intensities = np.asarray(intensities)[kept_indices]
                 occupancy_grid_mapper.integrate_frame(
-                    deskewed_scan, ref_ground_alignment @ self.poses[idx - self._first]
+                    deskewed_scan,
+                    ref_ground_alignment @ self.poses[idx - self._first],
+                    intensities=deskewed_intensities,
                 )
             occupancy_dir = os.path.join(self.results_dir, "occupancy_grid")
             if self.slam_config.occupancy_mapper.export_3d_occupancy_ply:
@@ -159,5 +168,4 @@ class SlamPipeline(OdometryPipeline):
 
     def _next(self, idx):
         dataframe = self._dataset[idx]
-        frame, timestamps = dataframe
-        return frame, timestamps
+        return self._unpack_scan(dataframe)
