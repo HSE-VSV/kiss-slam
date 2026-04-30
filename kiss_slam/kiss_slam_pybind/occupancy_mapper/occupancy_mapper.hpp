@@ -27,20 +27,31 @@
 #include <fstream>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 using Vector3fVector = std::vector<Eigen::Vector3f>;
 using Vector3iVector = std::vector<Eigen::Vector3i>;
 
 namespace occupancy_mapper {
+struct IntensityAccumulator {
+    float sum = 0.0F;
+    size_t count = 0;
+};
+
 class OccupancyMapper {
 public:
     OccupancyMapper(const float resolution);
     ~OccupancyMapper() = default;
 
     void IntegrateFrame(const Vector3fVector &pointcloud, const Eigen::Matrix4f &pose);
+    void IntegrateIntensities(const Vector3fVector &pointcloud,
+                              const std::vector<float> &intensities,
+                              const Eigen::Matrix4f &pose);
     std::tuple<Vector3iVector, std::vector<float>> GetOccupancyInformation() const;
     Vector3iVector GetOccupiedVoxels(const float occupancy_probability_threshold) const;
+    std::tuple<Vector3iVector, std::vector<float>> GetOccupiedVoxelsWithIntensity(
+        const float occupancy_probability_threshold) const;
     void SaveOccupancyVolume(const std::string &filename) const {
         std::ofstream data(filename, std::ios::binary);
         Bonxai::Serialize(data, map_);
@@ -49,9 +60,11 @@ public:
 private:
     void Bresenham3DLine(const Bonxai::CoordT &start_coord, const Bonxai::CoordT &end_coord);
     void UpdateVoxelOccupancy(const Bonxai::CoordT &coord, const float value);
+    void UpdateVoxelIntensity(const Bonxai::CoordT &coord, const float intensity);
 
     Bonxai::VoxelGrid<float> map_;
     using AccessorType = typename Bonxai::VoxelGrid<float>::Accessor;
     AccessorType accessor_;
+    std::unordered_map<Bonxai::CoordT, IntensityAccumulator> intensity_map_;
 };
 }  // namespace occupancy_mapper

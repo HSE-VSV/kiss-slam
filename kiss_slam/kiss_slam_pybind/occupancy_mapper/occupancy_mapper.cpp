@@ -26,6 +26,8 @@
 #include <algorithm>
 #include <bonxai/bonxai.hpp>
 #include <cmath>
+#include <limits>
+#include <stdexcept>
 #include <tuple>
 #include <vector>
 
@@ -56,6 +58,21 @@ void OccupancyMapper::IntegrateFrame(const Vector3fVector &pointcloud,
     });
 }
 
+void OccupancyMapper::IntegrateIntensities(const Vector3fVector &pointcloud,
+                                           const std::vector<float> &intensities,
+                                           const Eigen::Matrix4f &pose) {
+    if (pointcloud.size() != intensities.size()) {
+        throw std::invalid_argument("intensities must match pointcloud size");
+    }
+    const Eigen::Matrix3f &R = pose.block<3, 3>(0, 0);
+    const Eigen::Vector3f &t = pose.block<3, 1>(0, 3);
+    for (size_t idx = 0; idx < pointcloud.size(); ++idx) {
+        const Eigen::Vector3f point_tf = R * pointcloud.at(idx) + t;
+        const auto coord = map_.posToCoord(point_tf);
+        UpdateVoxelIntensity(coord, intensities.at(idx));
+    }
+}
+
 std::tuple<Vector3iVector, std::vector<float>> OccupancyMapper::GetOccupancyInformation() const {
     Vector3iVector voxel_indices;
     std::vector<float> voxel_occupancies;
@@ -84,11 +101,42 @@ Vector3iVector OccupancyMapper::GetOccupiedVoxels(
     return voxel_indices;
 }
 
+std::tuple<Vector3iVector, std::vector<float>> OccupancyMapper::GetOccupiedVoxelsWithIntensity(
+    const float occupancy_probability_threshold) const {
+    Vector3iVector voxel_indices;
+    std::vector<float> voxel_intensities;
+    const float logodds_threshold = LogOddsOccupied(occupancy_probability_threshold);
+    const auto num_of_active_voxels = map_.activeCellsCount();
+    voxel_indices.reserve(num_of_active_voxels);
+    voxel_intensities.reserve(num_of_active_voxels);
+    map_.forEachCell([&](const float &logodds, const Bonxai::CoordT &voxel) {
+        if (logodds > logodds_threshold) {
+            voxel_indices.emplace_back(Bonxai::ConvertPoint<Eigen::Vector3i>(voxel));
+            const auto intensity_it = intensity_map_.find(voxel);
+            if (intensity_it != intensity_map_.end() && intensity_it->second.count > 0) {
+                voxel_intensities.emplace_back(
+                    intensity_it->second.sum / static_cast<float>(intensity_it->second.count));
+            } else {
+                voxel_intensities.emplace_back(std::numeric_limits<float>::quiet_NaN());
+            }
+        }
+    });
+    voxel_indices.shrink_to_fit();
+    voxel_intensities.shrink_to_fit();
+    return std::make_tuple(voxel_indices, voxel_intensities);
+}
+
 void OccupancyMapper::UpdateVoxelOccupancy(const Bonxai::CoordT &coord, const float value) {
     // tg exploit Vdb caching
     accessor_.setCellOn(coord, 0.0);
     float *logodds = accessor_.value(coord);
     *logodds += value;
+}
+
+void OccupancyMapper::UpdateVoxelIntensity(const Bonxai::CoordT &coord, const float intensity) {
+    auto &accumulator = intensity_map_[coord];
+    accumulator.sum += intensity;
+    ++accumulator.count;
 }
 
 void OccupancyMapper::Bresenham3DLine(const Bonxai::CoordT &start_coord,

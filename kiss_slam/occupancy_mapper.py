@@ -21,7 +21,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 import os
-from collections import defaultdict
 from typing import Optional
 
 import numpy as np
@@ -42,8 +41,6 @@ class OccupancyGridMapper:
         self.config = config
         self.occupancy_mapping_pipeline = kiss_slam_pybind._OccupancyMapper(self.config.resolution)
         self.has_intensity = False
-        self._intensity_sum_by_voxel = defaultdict(float)
-        self._intensity_count_by_voxel = defaultdict(int)
 
     def integrate_frame(
         self, frame: np.ndarray, pose: np.ndarray, intensities: Optional[np.ndarray] = None
@@ -64,33 +61,51 @@ class OccupancyGridMapper:
                 f"for {len(frame)} points"
             )
 
+        frame = np.asarray(frame).reshape(-1, 3)
+        intensities = np.asarray(intensities).reshape(-1)
+        valid = np.isfinite(frame).all(axis=1) & np.isfinite(intensities)
+        if not np.any(valid):
+            return
         self.has_intensity = True
-        intensities = np.asarray(intensities)
-        rotation = pose[:3, :3]
-        translation = pose[:3, 3]
-        world_points = frame @ rotation.T + translation
-        valid = np.isfinite(world_points).all(axis=1) & np.isfinite(intensities)
-        voxel_indices = np.floor(world_points[valid] / self.config.resolution).astype(np.int32)
-        valid_intensities = intensities[valid].astype(np.float64)
-
-        for voxel, intensity in zip(voxel_indices, valid_intensities):
-            key = tuple(int(index) for index in voxel)
-            self._intensity_sum_by_voxel[key] += float(intensity)
-            self._intensity_count_by_voxel[key] += 1
+        self.occupancy_mapping_pipeline._integrate_intensities(
+            kiss_slam_pybind._Vector3fVector(frame[valid].astype(np.float32)),
+            intensities[valid].astype(np.float32),
+            pose,
+        )
 
     def compute_3d_occupancy_information(self):
         active_voxels, occupancies = self.occupancy_mapping_pipeline._get_active_voxels()
         self.active_voxels = np.asarray(active_voxels, np.int32)
         self.occupancies = np.asarray(occupancies, float)
-        self.occupied_voxels = self.active_voxels[
-            np.where(self.occupancies > self.config.occupied_threshold)[0]
-        ]
+        if self.has_intensity:
+            occupied_voxels, occupied_intensities = (
+                self.occupancy_mapping_pipeline._get_occupied_voxels_with_intensity(
+                    self.config.occupied_threshold
+                )
+            )
+            self.occupied_voxels = np.asarray(occupied_voxels, np.int32)
+            self.occupied_voxel_intensities = np.asarray(occupied_intensities, dtype=np.float32)
+        else:
+            self.occupied_voxels = self.active_voxels[
+                np.where(self.occupancies > self.config.occupied_threshold)[0]
+            ]
+            self.occupied_voxel_intensities = np.array([], dtype=np.float32)
 
     def compute_3d_occupied_voxels(self):
-        occupied_voxels = self.occupancy_mapping_pipeline._get_occupied_voxels(
-            self.config.occupied_threshold
-        )
-        self.occupied_voxels = np.asarray(occupied_voxels, np.int32)
+        if self.has_intensity:
+            occupied_voxels, occupied_intensities = (
+                self.occupancy_mapping_pipeline._get_occupied_voxels_with_intensity(
+                    self.config.occupied_threshold
+                )
+            )
+            self.occupied_voxels = np.asarray(occupied_voxels, np.int32)
+            self.occupied_voxel_intensities = np.asarray(occupied_intensities, dtype=np.float32)
+        else:
+            occupied_voxels = self.occupancy_mapping_pipeline._get_occupied_voxels(
+                self.config.occupied_threshold
+            )
+            self.occupied_voxels = np.asarray(occupied_voxels, np.int32)
+            self.occupied_voxel_intensities = np.array([], dtype=np.float32)
 
     def compute_2d_occupancy_information(self):
         min_z_idx = int(self.config.z_min // self.config.resolution)
@@ -126,20 +141,17 @@ class OccupancyGridMapper:
         )
 
     def _occupied_voxel_intensities(self):
-        values = np.zeros(len(self.occupied_voxels), dtype=np.float32)
-        missing = 0
-        for idx, voxel in enumerate(self.occupied_voxels):
-            key = tuple(int(index) for index in voxel)
-            count = self._intensity_count_by_voxel.get(key, 0)
-            if count > 0:
-                values[idx] = self._intensity_sum_by_voxel[key] / count
-            else:
-                missing += 1
-
+        values = np.asarray(
+            getattr(self, "occupied_voxel_intensities", np.array([], dtype=np.float32)),
+            dtype=np.float32,
+        )
+        if values.shape[0] != len(self.occupied_voxels):
+            values = np.full(len(self.occupied_voxels), np.nan, dtype=np.float32)
+        missing = int(np.count_nonzero(~np.isfinite(values)))
         if missing:
             print(
                 f"KissSLAM| Warning: {missing} occupied voxels had no intensity observations; "
-                "wrote intensity=0.0"
+                "wrote intensity=nan"
             )
         return values
 
