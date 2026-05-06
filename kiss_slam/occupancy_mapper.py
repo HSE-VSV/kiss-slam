@@ -130,15 +130,22 @@ class OccupancyGridMapper:
 
     def write_3d_occupancy_ply(self, output_dir):
         map_points = (0.5 + self.occupied_voxels) * self.config.resolution
-        o3d_pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(map_points))
-        o3d_pcd.estimate_normals()
+        positions = np.asarray(map_points, dtype=np.float32).reshape(-1, 3)
+        o3d_pcd = o3d.t.geometry.PointCloud()
+        o3d_pcd.point.positions = o3d.core.Tensor(positions, o3d.core.Dtype.Float32)
+        if positions.size:
+            legacy_pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(map_points))
+            legacy_pcd.estimate_normals()
+            o3d_pcd.point.normals = o3d.core.Tensor(
+                np.asarray(legacy_pcd.normals, dtype=np.float32), o3d.core.Dtype.Float32
+            )
+        if self.has_intensity:
+            intensities = self._occupied_voxel_intensities()
+            o3d_pcd.point.intensity = o3d.core.Tensor(
+                intensities.reshape(-1, 1), o3d.core.Dtype.Float32
+            )
         output_path = os.path.join(output_dir, "occupancy_pcd.ply")
-        if not self.has_intensity:
-            o3d.io.write_point_cloud(output_path, o3d_pcd)
-            return
-        self._write_occupancy_ply_with_intensity(
-            output_path, map_points, np.asarray(o3d_pcd.normals)
-        )
+        o3d.t.io.write_point_cloud(output_path, o3d_pcd)
 
     def _occupied_voxel_intensities(self):
         values = np.asarray(
@@ -154,29 +161,6 @@ class OccupancyGridMapper:
                 "wrote intensity=nan"
             )
         return values
-
-    def _write_occupancy_ply_with_intensity(
-        self, output_path: str, map_points: np.ndarray, normals: np.ndarray
-    ):
-        intensities = self._occupied_voxel_intensities()
-        with open(output_path, "w") as ply_file:
-            ply_file.write("ply\n")
-            ply_file.write("format ascii 1.0\n")
-            ply_file.write(f"element vertex {len(map_points)}\n")
-            ply_file.write("property float x\n")
-            ply_file.write("property float y\n")
-            ply_file.write("property float z\n")
-            ply_file.write("property float nx\n")
-            ply_file.write("property float ny\n")
-            ply_file.write("property float nz\n")
-            ply_file.write("property float intensity\n")
-            ply_file.write("end_header\n")
-            for point, normal, intensity in zip(map_points, normals, intensities):
-                ply_file.write(
-                    f"{point[0]:.9g} {point[1]:.9g} {point[2]:.9g} "
-                    f"{normal[0]:.9g} {normal[1]:.9g} {normal[2]:.9g} "
-                    f"{float(intensity):.9g}\n"
-                )
 
     def write_3d_occupancy_boxai_volume(self, output_dir):
         self.occupancy_mapping_pipeline._save_occupancy_volume(
